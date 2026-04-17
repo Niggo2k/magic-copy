@@ -1,18 +1,12 @@
 import { useEffect, useMemo, useRef } from "react"
 
-import { shikiToMonaco } from "@shikijs/monaco"
 import { html as htmlBeautify } from "js-beautify"
 import * as monaco from "monaco-editor"
-import {
-  createHighlighter,
-  createJavaScriptRegexEngine,
-  type Highlighter
-} from "shiki"
 
-// Monaco's default workers use a `new Worker(new URL(...))` pattern that Plasmo
-// can't bundle for the devtools sidebar. We don't need background workers for
-// read-only highlighting, so stub the environment to run everything on the main
-// thread.
+// Plasmo can't bundle Monaco's worker URLs for the devtools panel, so stub the
+// worker environment. Monaco's built-in Monarch tokenizers (html/css/js) run
+// on the main thread and don't need workers for syntax highlighting — workers
+// are only used for IntelliSense, which we don't need for a read-only viewer.
 if (typeof self !== "undefined" && !(self as any).MonacoEnvironment) {
   ;(self as any).MonacoEnvironment = {
     getWorker: () => ({
@@ -25,36 +19,79 @@ if (typeof self !== "undefined" && !(self as any).MonacoEnvironment) {
   }
 }
 
-const LANGUAGES = ["html", "css", "javascript"] as const
-const THEMES = ["vitesse-dark", "vitesse-light"] as const
+type Language = "html" | "css" | "javascript"
 
-let highlighterPromise: Promise<Highlighter> | null = null
-let shikiRegistered = false
+// VS Code-style themes matching the rest of the sidebar chrome. Defined once,
+// registered lazily so the module is safe to import in any order.
+let themesDefined = false
+function ensureThemes() {
+  if (themesDefined) return
+  themesDefined = true
 
-function getHighlighter(): Promise<Highlighter> {
-  if (!highlighterPromise) {
-    // Use the JS regex engine instead of Oniguruma — the WASM binary can't be
-    // loaded from a Plasmo-bundled devtools panel, which surfaces as
-    // "createOnigurumaEngine is not a function" at runtime.
-    highlighterPromise = createHighlighter({
-      themes: [...THEMES],
-      langs: [...LANGUAGES],
-      engine: createJavaScriptRegexEngine()
-    }).then((h) => {
-      LANGUAGES.forEach((id) => { monaco.languages.register({ id }) })
-      if (!shikiRegistered) {
-        shikiToMonaco(h, monaco)
-        shikiRegistered = true
-      }
-      return h
-    })
-  }
-  return highlighterPromise
+  monaco.editor.defineTheme("magic-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [
+      { token: "tag",                  foreground: "569CD6" },
+      { token: "tag.html",             foreground: "569CD6" },
+      { token: "metatag.html",         foreground: "569CD6" },
+      { token: "metatag.content.html", foreground: "CE9178" },
+      { token: "attribute.name",       foreground: "9CDCFE" },
+      { token: "attribute.name.html",  foreground: "9CDCFE" },
+      { token: "attribute.value",      foreground: "CE9178" },
+      { token: "attribute.value.html", foreground: "CE9178" },
+      { token: "delimiter",            foreground: "808080" },
+      { token: "delimiter.html",       foreground: "808080" },
+      { token: "comment",              foreground: "6A9955", fontStyle: "italic" },
+      { token: "string",               foreground: "CE9178" },
+      { token: "keyword",              foreground: "C586C0" },
+      { token: "number",               foreground: "B5CEA8" },
+      { token: "operator",             foreground: "D4D4D4" },
+      { token: "type",                 foreground: "4EC9B0" }
+    ],
+    colors: {
+      "editor.background":                 "#151619",
+      "editor.foreground":                 "#d0d4db",
+      "editorLineNumber.foreground":       "#5a6472",
+      "editorLineNumber.activeForeground": "#c0c6d0",
+      "editor.lineHighlightBackground":    "#1e2024",
+      "editor.lineHighlightBorder":        "#1e2024",
+      "editorGutter.background":           "#151619",
+      "editor.foldBackground":             "#2a2d3180"
+    }
+  })
+
+  monaco.editor.defineTheme("magic-light", {
+    base: "vs",
+    inherit: true,
+    rules: [
+      { token: "tag",                  foreground: "800000" },
+      { token: "tag.html",             foreground: "800000" },
+      { token: "metatag.html",         foreground: "800000" },
+      { token: "attribute.name",       foreground: "FF0000" },
+      { token: "attribute.name.html",  foreground: "FF0000" },
+      { token: "attribute.value",      foreground: "0451A5" },
+      { token: "attribute.value.html", foreground: "0451A5" },
+      { token: "delimiter",            foreground: "808080" },
+      { token: "delimiter.html",       foreground: "808080" },
+      { token: "comment",              foreground: "008000", fontStyle: "italic" },
+      { token: "string",               foreground: "A31515" },
+      { token: "keyword",              foreground: "0000FF" },
+      { token: "number",               foreground: "098658" }
+    ],
+    colors: {
+      "editor.background":                 "#ffffff",
+      "editorLineNumber.foreground":       "#237893",
+      "editorLineNumber.activeForeground": "#0b216f",
+      "editor.lineHighlightBackground":    "#f3f3f3",
+      "editor.lineHighlightBorder":        "#f3f3f3"
+    }
+  })
 }
 
 interface MonacoSourceProps {
   value: string
-  language?: (typeof LANGUAGES)[number]
+  language?: Language
   dark?: boolean
 }
 
@@ -78,8 +115,17 @@ function MonacoSource({
           wrap_line_length: 0,
           preserve_newlines: false,
           end_with_newline: true,
-          unformatted: []
-        })
+          indent_inner_html: true,
+          // Default js-beautify keeps <span>, <a>, <strong>, … inline so their
+          // parents stay on one line. We want a break after every closing tag,
+          // so disable the inline-tag exception list and the "unformatted" and
+          // "content_unformatted" passthroughs that opt tags out of formatting.
+          inline: [],
+          unformatted: [],
+          content_unformatted: [],
+          // Keep <pre> on one line so its whitespace is preserved.
+          extra_liners: []
+        } as any)
       } catch {
         return value
       }
@@ -89,39 +135,35 @@ function MonacoSource({
 
   useEffect(() => {
     if (!containerRef.current) return
-    let disposed = false
 
-    getHighlighter().then(() => {
-      if (disposed || !containerRef.current) return
-      editorRef.current = monaco.editor.create(containerRef.current, {
-        value: formatted,
-        language: "",
-        theme: dark ? "vitesse-dark" : "vitesse-light",
-        readOnly: true,
-        domReadOnly: true,
-        automaticLayout: true,
-        minimap: { enabled: false },
-        scrollBeyondLastLine: true,
-        fontSize: 12,
-        lineHeight: 18,
-        lineNumbers: "on",
-        lineNumbersMinChars: 3,
-        renderLineHighlight: "all",
-        // Indentation-based folding works without the HTML language service,
-        // which we don't load because Plasmo can't bundle Monaco's web workers.
-        folding: true,
-        foldingStrategy: "indentation",
-        foldingHighlight: true,
-        showFoldingControls: "always",
-        unfoldOnClickAfterEndOfLine: true,
-        contextmenu: false,
-        glyphMargin: false,
-        scrollbar: { useShadows: false, verticalScrollbarSize: 10 }
-      })
+    ensureThemes()
+    editorRef.current = monaco.editor.create(containerRef.current, {
+      value: formatted,
+      language,
+      theme: dark ? "magic-dark" : "magic-light",
+      readOnly: true,
+      domReadOnly: true,
+      automaticLayout: true,
+      minimap: { enabled: false },
+      scrollBeyondLastLine: false,
+      fontSize: 12,
+      lineHeight: 18,
+      lineNumbers: "on",
+      lineNumbersMinChars: 3,
+      renderLineHighlight: "all",
+      // Indentation-based folding works without the HTML language service
+      // (which we skip because Plasmo can't bundle Monaco's workers).
+      folding: true,
+      foldingStrategy: "indentation",
+      foldingHighlight: true,
+      showFoldingControls: "always",
+      unfoldOnClickAfterEndOfLine: true,
+      contextmenu: false,
+      glyphMargin: false,
+      scrollbar: { useShadows: false, verticalScrollbarSize: 10 }
     })
 
     return () => {
-      disposed = true
       editorRef.current?.dispose()
       editorRef.current = null
     }
@@ -139,7 +181,7 @@ function MonacoSource({
   }, [formatted, language])
 
   useEffect(() => {
-    monaco.editor.setTheme(dark ? "vitesse-dark" : "vitesse-light")
+    monaco.editor.setTheme(dark ? "magic-dark" : "magic-light")
   }, [dark])
 
   return <div ref={containerRef} style={containerStyle} />
