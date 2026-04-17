@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react"
 
+import MonacoSource from "~components/MonacoSource"
 import { buildDevtoolsEvalSnippet } from "~lib/inline-styles"
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -13,9 +14,13 @@ type Status =
 type Tab = "preview" | "source"
 
 interface EvalResult {
-  frozen: string   // base + pseudo overrides inlined → clipboard
-  liveHTML: string // base + custom props + data-magic-id → preview base
-  liveCSS: string  // :root vars + @font-face + data-magic-id:state rules → preview live
+  frozen: string         // base + pseudo overrides inlined → clipboard
+  liveHTML: string       // base + custom props + data-magic-id → preview base
+  liveCSS: string        // :root vars + @font-face + data-magic-id:state rules → preview live
+  forcedStateCSS: Record<string, string> // per-pseudo CSS with the pseudo stripped → "force state" overlay
+  pageBackground: string // computed background of the inspected page
+  isDark: boolean        // whether prefers-color-scheme: dark is active
+  schemeCSS: { dark: string; light: string } // inner rules from prefers-color-scheme media queries
 }
 
 interface PseudoState {
@@ -48,19 +53,74 @@ function evalInInspectedWindow(expression: string): Promise<unknown> {
   })
 }
 
-function buildPreviewDoc(liveHTML: string, liveCSS: string): string {
+function buildPreviewDoc(
+  liveHTML: string,
+  liveCSS: string,
+  forcedStateCSS: Record<string, string>,
+  activeStates: Set<string>,
+  pageBackground: string,
+  isDark: boolean
+): string {
+  let forced = ""
+  activeStates.forEach((state) => {
+    const css = forcedStateCSS?.[state]
+    if (css) forced += css
+  })
   return `<!DOCTYPE html>
-<html>
+<html style="color-scheme:${isDark ? "dark" : "light"}">
 <head>
 <meta charset="utf-8">
 <style>
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 8px; background: #fff; }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    background: ${pageBackground};
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 16px;
+  }
+  /* Shrink-wrap the element so flex centering kicks in when it fits.
+     max-width: 100% prevents it from overflowing when it's too wide. */
+  .mc-wrap {
+    width: fit-content;
+    max-width: 100%;
+    min-width: 0;
+  }
 ${liveCSS}
+/* Forced pseudo-state overlays (toggled via chips — always applied). */
+${forced}
 </style>
 </head>
-<body>${liveHTML}</body>
+<body><div class="mc-wrap">${liveHTML}</div></body>
 </html>`
+}
+
+function wireHoverPolyfill(iframe: HTMLIFrameElement) {
+  const doc = iframe.contentDocument
+  if (!doc) return
+  const nodes = doc.querySelectorAll("[data-magic-id]")
+  function set(el: Element, attr: string, on: boolean) {
+    if (on) el.setAttribute(attr, "")
+    else el.removeAttribute(attr)
+  }
+  nodes.forEach((el) => {
+    el.addEventListener("mouseenter", () => set(el, "data-mc-hover", true))
+    el.addEventListener("mouseleave", () => {
+      set(el, "data-mc-hover", false)
+      set(el, "data-mc-active", false)
+    })
+    el.addEventListener("mousedown", () => set(el, "data-mc-active", true))
+    el.addEventListener("mouseup", () => set(el, "data-mc-active", false))
+    el.addEventListener("focusin", () => {
+      set(el, "data-mc-focus", true)
+      set(el, "data-mc-focus-within", true)
+    })
+    el.addEventListener("focusout", () => {
+      set(el, "data-mc-focus", false)
+      set(el, "data-mc-focus-within", false)
+    })
+  })
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -70,6 +130,7 @@ function Sidebar() {
   const [result, setResult] = useState<EvalResult | null>(null)
   const [activeTab, setActiveTab] = useState<Tab>("preview")
   const [activeStates, setActiveStates] = useState<Set<string>>(new Set())
+  const [previewDark, setPreviewDark] = useState<boolean>(false)
 
   const toggleState = useCallback((id: string) => {
     setActiveStates((prev) => {
@@ -102,6 +163,7 @@ function Sidebar() {
       await navigator.clipboard.writeText(evalResult.frozen)
       setStatus({ kind: "ok", bytes: evalResult.frozen.length })
       setResult(evalResult)
+      setPreviewDark(evalResult.isDark)
       setActiveTab("preview")
     } catch (err) {
       setStatus({
@@ -113,10 +175,19 @@ function Sidebar() {
 
   return (
     <div style={wrapperStyle}>
+      <style>{`
+        html, body { margin: 0; padding: 0; background: #1e1f22; }
+        .mc-btn { transition: background 120ms ease, border-color 120ms ease, color 120ms ease, box-shadow 120ms ease, transform 80ms ease; }
+        .mc-btn:hover:not(:disabled) { filter: brightness(1.12); }
+        .mc-btn:active:not(:disabled) { transform: translateY(1px); }
+        .mc-btn:focus-visible { outline: 2px solid #7aa2ff; outline-offset: 2px; }
+        .mc-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+      `}</style>
       {/* ── Toolbar ── */}
       <div style={toolbarStyle}>
         <button
           type="button"
+          className="mc-btn"
           onClick={handleCopy}
           disabled={status.kind === "working"}
           style={copyBtnStyle}>
@@ -127,26 +198,32 @@ function Sidebar() {
 
       {/* ── Pseudo-state toggles ── */}
       <div style={statesRowStyle}>
-        <span style={statesLabelStyle}>Simulate states:</span>
+        <span style={statesLabelStyle}>Simulate states</span>
         <div style={chipsStyle}>
-          {PSEUDO_STATES.map(({ id, label }) => (
-            <button
-              key={id}
-              type="button"
-              onClick={() => toggleState(id)}
-              title={`Include styles from ${label} rules`}
-              style={{
-                ...chipBase,
-                background: activeStates.has(id) ? "#1a73e8" : "#f1f3f4",
-                color: activeStates.has(id) ? "#fff" : "#444",
-                borderColor: activeStates.has(id) ? "#1a73e8" : "#dadce0"
-              }}>
-              {label}
-            </button>
-          ))}
+          {PSEUDO_STATES.map(({ id, label }) => {
+            const on = activeStates.has(id)
+            return (
+              <button
+                key={id}
+                type="button"
+                className="mc-btn"
+                onClick={() => toggleState(id)}
+                title={`Force ${label} in preview & include those styles in the next copy`}
+                style={{
+                  ...chipBase,
+                  background: on ? "#3b82f6" : "#2a2d31",
+                  color: on ? "#fff" : "#c8ccd1",
+                  borderColor: on ? "#3b82f6" : "#3a3e44",
+                  boxShadow: on ? "0 1px 0 rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.08)" : "none"
+                }}>
+                {label}
+              </button>
+            )
+          })}
           {activeStates.size > 0 && (
             <button
               type="button"
+              className="mc-btn"
               onClick={() => setActiveStates(new Set())}
               style={clearBtnStyle}
               title="Clear all state filters">
@@ -170,21 +247,53 @@ function Sidebar() {
               active={activeTab === "source"}
               onClick={() => setActiveTab("source")}
             />
+            <div style={{ flex: 1 }} />
+            <button
+              type="button"
+              className="mc-btn"
+              onClick={() => setPreviewDark((d) => !d)}
+              title={`Switch preview to ${previewDark ? "light" : "dark"} mode`}
+              style={schemeToggleStyle}>
+              {previewDark ? "☀︎" : "☾"}
+            </button>
           </div>
 
           {activeTab === "preview" ? (
-            // liveHTML + styles: base inline styles + injected CSS rules so that
-            // hovering / focusing inside the iframe fires the real pseudo-state styles.
             <iframe
-              key={result.liveHTML + result.liveCSS}
-              srcDoc={buildPreviewDoc(result.liveHTML, result.liveCSS)}
+              key={
+                result.liveHTML +
+                "|" +
+                result.liveCSS +
+                "|" +
+                String(previewDark) +
+                "|" +
+                Array.from(activeStates).sort().join(",")
+              }
+              srcDoc={buildPreviewDoc(
+                result.liveHTML,
+                result.liveCSS + (previewDark ? result.schemeCSS.dark : result.schemeCSS.light),
+                result.forcedStateCSS ?? {},
+                activeStates,
+                previewDark === result.isDark
+                  ? result.pageBackground
+                  : previewDark ? "#121212" : "#ffffff",
+                previewDark
+              )}
               sandbox="allow-same-origin"
+              onLoad={(e) => wireHoverPolyfill(e.currentTarget)}
               style={iframeStyle}
               title="Element preview"
             />
           ) : (
-            // Source shows the frozen clipboard version (fully self-contained).
-            <pre style={sourceStyle}>{result.frozen}</pre>
+            // Source shows the frozen clipboard version (fully self-contained),
+            // rendered with Monaco + Shiki for proper HTML/CSS syntax highlighting.
+            <div style={sourceWrapperStyle}>
+              <MonacoSource
+                value={result.frozen}
+                language="html"
+                dark={previewDark}
+              />
+            </div>
           )}
         </>
       ) : (
@@ -211,12 +320,13 @@ function TabButton({
   return (
     <button
       type="button"
+      className="mc-btn"
       onClick={onClick}
       style={{
         ...tabBtnBase,
-        borderBottom: active ? "2px solid #1a73e8" : "2px solid transparent",
-        color: active ? "#1a73e8" : "#555",
-        fontWeight: active ? 600 : 400
+        borderBottom: active ? "2px solid #7aa2ff" : "2px solid transparent",
+        color: active ? "#7aa2ff" : "#a9afb8",
+        fontWeight: active ? 600 : 500
       }}>
       {label}
     </button>
@@ -226,15 +336,15 @@ function TabButton({
 function StatusBadge({ status }: { status: Status }) {
   if (status.kind === "idle") return null
   if (status.kind === "working")
-    return <span style={{ ...badgeBase, color: "#666" }}>Working…</span>
+    return <span style={{ ...badgeBase, color: "#a9afb8" }}>Working…</span>
   if (status.kind === "ok")
     return (
-      <span style={{ ...badgeBase, color: "#1a7f37" }}>
+      <span style={{ ...badgeBase, color: "#4ade80" }}>
         ✓ {status.bytes.toLocaleString()} chars
       </span>
     )
   return (
-    <span style={{ ...badgeBase, color: "#b42318" }}>Error: {status.message}</span>
+    <span style={{ ...badgeBase, color: "#f87171" }}>Error: {status.message}</span>
   )
 }
 
@@ -245,42 +355,51 @@ const wrapperStyle: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
   height: "100vh",
-  overflow: "hidden"
+  overflow: "hidden",
+  background: "#1e1f22",
+  color: "#e6e8eb",
+  colorScheme: "dark"
 }
 
 const toolbarStyle: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
   gap: "8px",
-  padding: "7px 10px",
-  borderBottom: "1px solid #e0e0e0",
+  padding: "8px 10px",
+  borderBottom: "1px solid #2b2e33",
+  background: "#1e1f22",
   flexShrink: 0
 }
 
 const copyBtnStyle: React.CSSProperties = {
-  padding: "5px 10px",
+  padding: "6px 12px",
   font: "inherit",
-  fontWeight: 500,
+  fontWeight: 600,
   cursor: "pointer",
-  border: "1px solid #c3c3c3",
-  borderRadius: "4px",
-  background: "#fafafa",
-  whiteSpace: "nowrap"
+  border: "1px solid #2f6fe6",
+  borderRadius: "6px",
+  background: "linear-gradient(180deg, #4f8cff 0%, #2f6fe6 100%)",
+  color: "#ffffff",
+  whiteSpace: "nowrap",
+  boxShadow: "0 1px 0 rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.15)"
 }
 
 const statesRowStyle: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
-  gap: "4px",
-  padding: "7px 10px",
-  borderBottom: "1px solid #e0e0e0",
+  gap: "6px",
+  padding: "8px 10px",
+  borderBottom: "1px solid #2b2e33",
+  background: "#1e1f22",
   flexShrink: 0
 }
 
 const statesLabelStyle: React.CSSProperties = {
-  color: "#666",
+  color: "#8b9098",
   fontSize: "11px",
-  fontWeight: 500
+  fontWeight: 600,
+  textTransform: "uppercase",
+  letterSpacing: "0.04em"
 }
 
 const chipsStyle: React.CSSProperties = {
@@ -290,40 +409,53 @@ const chipsStyle: React.CSSProperties = {
 }
 
 const chipBase: React.CSSProperties = {
-  padding: "2px 7px",
+  padding: "3px 9px",
   fontSize: "11px",
-  fontFamily: "monospace",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
   border: "1px solid",
-  borderRadius: "10px",
+  borderRadius: "999px",
   cursor: "pointer",
-  lineHeight: "1.6",
-  transition: "background 0.1s, color 0.1s"
+  lineHeight: "1.6"
 }
 
 const clearBtnStyle: React.CSSProperties = {
-  padding: "2px 7px",
+  padding: "3px 9px",
   fontSize: "11px",
-  border: "1px solid #dadce0",
-  borderRadius: "10px",
+  border: "1px solid #3a3e44",
+  borderRadius: "999px",
   cursor: "pointer",
-  background: "none",
-  color: "#888",
+  background: "transparent",
+  color: "#a9afb8",
   lineHeight: "1.6"
 }
 
 const tabBarStyle: React.CSSProperties = {
   display: "flex",
-  borderBottom: "1px solid #e0e0e0",
+  borderBottom: "1px solid #2b2e33",
+  background: "#1e1f22",
   flexShrink: 0
 }
 
+const schemeToggleStyle: React.CSSProperties = {
+  padding: "4px 10px",
+  font: "13px/1 system-ui",
+  background: "#2a2d31",
+  border: "1px solid #3a3e44",
+  borderRadius: "6px",
+  cursor: "pointer",
+  color: "#e6e8eb",
+  alignSelf: "center",
+  margin: "4px 6px"
+}
+
 const tabBtnBase: React.CSSProperties = {
-  padding: "5px 12px",
+  padding: "7px 14px",
   font: "inherit",
   background: "none",
   border: "none",
   cursor: "pointer",
-  fontSize: "11px"
+  fontSize: "11px",
+  letterSpacing: "0.02em"
 }
 
 const iframeStyle: React.CSSProperties = {
@@ -333,28 +465,24 @@ const iframeStyle: React.CSSProperties = {
   background: "#fff"
 }
 
-const sourceStyle: React.CSSProperties = {
+const sourceWrapperStyle: React.CSSProperties = {
   flex: 1,
-  margin: 0,
-  padding: "8px 10px",
-  overflowY: "auto",
-  overflowX: "auto",
-  fontSize: "11px",
-  fontFamily: "monospace",
-  whiteSpace: "pre-wrap",
-  wordBreak: "break-all",
-  background: "#f5f5f5",
-  lineHeight: 1.5
+  display: "flex",
+  flexDirection: "column",
+  minHeight: 0,
+  background: "#151619"
 }
 
 const hintStyle: React.CSSProperties = {
-  color: "#777",
-  padding: "10px 12px",
-  fontSize: "11px"
+  color: "#8b9098",
+  padding: "12px 14px",
+  fontSize: "11px",
+  lineHeight: 1.5
 }
 
 const badgeBase: React.CSSProperties = {
-  fontSize: "11px"
+  fontSize: "11px",
+  fontWeight: 500
 }
 
 export default Sidebar

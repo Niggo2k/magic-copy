@@ -1,6 +1,6 @@
 // ─── Content-script typed implementation ─────────────────────────────────────
-// The right-click path captures whatever state is visually active at that
-// moment (getComputedStyle is live), so no extra pseudo-state logic needed.
+// Right-click path: getComputedStyle is live so it already reflects the active
+// visual state (hover, focus, etc.) — no extra pseudo-state logic needed.
 
 export function serializeWithInlineStyles(root: Element): string {
   const clone = root.cloneNode(true) as Element
@@ -23,65 +23,58 @@ export function serializeWithInlineStyles(root: Element): string {
 
 // ─── DevTools eval snippet ────────────────────────────────────────────────────
 //
-// Runs inside chrome.devtools.inspectedWindow.eval — the full live page DOM
-// is available, including document.styleSheets, getComputedStyle, and $0.
+// Runs inside chrome.devtools.inspectedWindow.eval.  Full live page DOM is
+// available (document.styleSheets, getComputedStyle, $0).
 //
-// Returns { frozen, liveHTML, liveCSS } or { __magicCopyError }.
+// Returns { frozen, liveHTML, liveCSS, forcedStateCSS, pageBackground, isDark, schemeCSS }
+// or      { __magicCopyError: string }
 //
-//  frozen   — every element has ALL computed standard properties + resolved
-//             pseudo-state overrides inlined as style="…".  Self-contained.
-//             Sent to the clipboard.
+//  frozen          — clipboard copy.  Every element has all computed standard
+//                   properties + resolved pseudo-state overrides (for the
+//                   chip-selected states) inlined.  Fully self-contained.
 //
-//  liveHTML — every element has ALL computed standard properties + ALL resolved
-//             CSS custom properties inlined, PLUS a data-magic-id="N" attribute
-//             that the liveCSS rules reference.  Sent to the preview iframe.
+//  liveHTML        — preview base.  Every element has all computed standard
+//                   properties + all resolved CSS custom properties inlined.
+//                   Original class/id/attribute values are preserved so that
+//                   the page's CSS selectors continue to match.
 //
-//  liveCSS  — reconstructed CSS that makes hover/focus/… work live:
-//               1. :root { --var: <resolved> }  for every custom property
-//               2. @font-face rules so the right font loads in the iframe
-//               3. [data-magic-id="N"]:hover { … !important }
-//                  Where N is the element that TRIGGERS the state, and an
-//                  optional descendant selector like
-//                  [data-magic-id="P"]:hover [data-magic-id="C"] { … }
-//                  is used when the ancestor that triggers :hover is a
-//                  different element from the one that changes visually.
+//  liveCSS         — preview stylesheet injected into the iframe <style> tag:
+//                     1. :root { --var: resolved-value } for every custom prop
+//                     2. @font-face rules verbatim
+//                     3. Every pseudo-state rule from the page's stylesheets,
+//                        re-emitted WITH !important on each declaration so they
+//                        override the element's inline base styles when the
+//                        state fires.  Original selectors are preserved, so
+//                        .nav:hover .link works correctly when the user copied
+//                        the .nav element (both .nav and .link are present).
+//                        Non-color-scheme @media wrappers are kept intact.
 //
-// ── Pseudo-state simulation strategy ─────────────────────────────────────────
+//  forcedStateCSS  — { hover, active, focus, ... }: CSS per pseudo-state
+//                   with the pseudo STRIPPED from each selector, so the rule
+//                   applies unconditionally.  Sidebar concatenates the entries
+//                   for whichever chips are toggled, emulating DevTools'
+//                   :hov "Force state" on every element in the subtree.
 //
-// 1. Walk document.styleSheets recursively (into @media / @supports).
-// 2. Collect every rule whose selector contains a target pseudo-class.
-//    Store: original selector, base selector (pseudo stripped), which states
-//    were present, and the rule's explicit property declarations.
-// 3. frozen: inline getComputedStyle for every element, then overlay any
-//    matching rule's explicit props on top (covers ancestor-triggered rules
-//    like .nav:hover .link because we run in the full page DOM context).
-// 4. liveCSS: assign data-magic-id=N to every element (N = index in tree).
-//    For each rule matching element N, detect which ancestor M (also in tree)
-//    carries the :hover/:focus/… via findAnchorIndex.
-//    Emit [data-magic-id="M"]:state [data-magic-id="N"] { … !important }
-//    or [data-magic-id="N"]:state { … } if M == N (direct target).
-//    Because custom properties in the rule's declarations may use var(--x),
-//    and those variables exist in the real page but not the iframe, we resolve
-//    them: the full set of custom properties is inlined on each element in
-//    liveHTML, and :root { } in liveCSS covers the global tokens.
+//  schemeCSS       — { dark, light }: inner rules from prefers-color-scheme
+//                   media queries (without wrapper), injected on toggle.
 
 const serializerBody = `
-  // ── Utility: walk rule lists recursively ─────────────────────────────────
-  function eachRule(ruleList, fn) {
-    for (var i = 0; i < ruleList.length; i++) {
-      var r = ruleList[i];
-      if (r.cssRules) { eachRule(r.cssRules, fn); } else { fn(r); }
-    }
-  }
-
+  // ── Utilities ─────────────────────────────────────────────────────────────
   function allSheetRules(fn) {
     for (var si = 0; si < document.styleSheets.length; si++) {
-      try { eachRule(document.styleSheets[si].cssRules, fn); } catch(e) {}
+      try { walkRuleList(document.styleSheets[si].cssRules, fn); } catch(e) {}
     }
   }
 
-  // ── 1. Root-level CSS custom properties ──────────────────────────────────
-  function buildRootVarsCSS() {
+  function walkRuleList(list, fn) {
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      if (r.cssRules) { fn(r, true); } else { fn(r, false); }
+    }
+  }
+
+  // ── CSS custom properties ─────────────────────────────────────────────────
+  function collectCustomPropNames() {
     var names = Object.create(null);
     allSheetRules(function(r) {
       if (!r.style) return;
@@ -90,16 +83,31 @@ const serializerBody = `
         if (p.indexOf('--') === 0) names[p] = 1;
       }
     });
+    return Object.keys(names);
+  }
+
+  function buildRootVarsCSS(propNames) {
     var root = getComputedStyle(document.documentElement);
     var css = ':root{';
-    for (var p in names) {
-      var v = root.getPropertyValue(p).trim();
-      if (v) css += p + ':' + v + ';';
+    for (var i = 0; i < propNames.length; i++) {
+      var v = root.getPropertyValue(propNames[i]).trim();
+      if (v) css += propNames[i] + ':' + v + ';';
     }
     return css + '}';
   }
 
-  // ── 2. @font-face rules ───────────────────────────────────────────────────
+  // ── Page background + theme ───────────────────────────────────────────────
+  function getPageBackground() {
+    var isDark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    var candidates = [document.body, document.documentElement];
+    for (var i = 0; i < candidates.length; i++) {
+      var bg = getComputedStyle(candidates[i]).backgroundColor;
+      if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') return { color: bg, isDark: isDark };
+    }
+    return { color: isDark ? '#121212' : '#ffffff', isDark: isDark };
+  }
+
+  // ── @font-face ────────────────────────────────────────────────────────────
   function extractFontFaceCSS() {
     var css = '';
     for (var si = 0; si < document.styleSheets.length; si++) {
@@ -112,33 +120,257 @@ const serializerBody = `
     return css;
   }
 
-  // ── 3. Pseudo-state rule collection ──────────────────────────────────────
+  // ── prefers-color-scheme rules ────────────────────────────────────────────
+  function extractColorSchemeCSS() {
+    var dark = '', light = '';
+    for (var si = 0; si < document.styleSheets.length; si++) {
+      var rules; try { rules = document.styleSheets[si].cssRules; } catch(e) { continue; }
+      for (var ri = 0; ri < rules.length; ri++) {
+        var r = rules[ri];
+        if (!r.cssRules) continue;
+        var mq = r.conditionText || (r.media && r.media.mediaText) || '';
+        var isDark  = /prefers-color-scheme\\s*:\\s*dark/i.test(mq);
+        var isLight = /prefers-color-scheme\\s*:\\s*light/i.test(mq);
+        if (!isDark && !isLight) continue;
+        for (var ii = 0; ii < r.cssRules.length; ii++) {
+          try {
+            var text = r.cssRules[ii].cssText + '\\n';
+            if (isDark) dark += text; else light += text;
+          } catch(e) {}
+        }
+      }
+    }
+    return { dark: dark, light: light };
+  }
+
+  // ── Shared pseudo-state rule walker ───────────────────────────────────────
+  // Walks every stylesheet (incl. adoptedStyleSheets, @media, @supports),
+  // finds rules whose selector contains an allowlisted pseudo-class, and
+  // delegates selector rewriting to \`transform\`.  Declarations always keep
+  // !important so they beat the inline base written by serializeLive.
+  //
+  // transform(selectorPart, pseudoMatch, nodes): string
+  //   - selectorPart: one comma-separated selector (trimmed)
+  //   - pseudoMatch:  RegExpExecArray from the pseudo regex (or null)
+  //   - nodes:        gatherTree(root)
+  //   returns: '' to skip, else one-or-more comma-separated selectors
+
+  // Longer names first so focus-visible/focus-within beat plain focus,
+  // placeholder-shown beats shorter prefixes, etc.  Expanded to cover
+  // "every STATE OF THE ELEMENT OR CHILD ELEMENTS".
+  var MAGIC_PSEUDO = [
+    'placeholder-shown','focus-visible','focus-within','read-write','read-only',
+    'out-of-range','in-range','any-link','indeterminate','disabled','required',
+    'optional','enabled','checked','visited','default','invalid','target',
+    'active','hover','focus','valid','blank','link'
+  ];
+  // Template literal (½) -> eval'd string literal (¼) -> regex source.
+  // Four backslashes survive to one regex-level backslash.
+  // Lookbehind '(?<![:\\\\])' (in template) -> '(?<![:\\])' (in string) ->
+  // regex char class [:\\] meaning "not preceded by another ':' nor by a
+  // literal backslash" — so '::before' is excluded AND Tailwind's escaped
+  // class name '.hover\\:bg-red-500:hover' is not split at the first ':hover'.
+  var MAGIC_PSEUDO_SRC = '(?<![:\\\\\\\\]):(' + MAGIC_PSEUDO.join('|') + ')(?![\\\\w-])';
+
+  function buildDecls(style) {
+    var decls = '';
+    for (var pi = 0; pi < style.length; pi++) {
+      var p = style[pi];
+      decls += p + ':' + style.getPropertyValue(p) + ' !important;';
+    }
+    return decls;
+  }
+
+  function walkPseudoRules(root, transform, pseudoSrc) {
+    var nodes = gatherTree(root);
+    var src = pseudoSrc || MAGIC_PSEUDO_SRC;
+
+    function processRule(r) {
+      if (!r.selectorText || !r.style) return '';
+      // Fresh regex per rule — non-global, no lastIndex carry-over.
+      if (!new RegExp(src, 'i').test(r.selectorText)) return '';
+      var decls = buildDecls(r.style);
+      if (!decls) return '';
+      var out = '';
+      var sels = r.selectorText.split(',');
+      for (var sp = 0; sp < sels.length; sp++) {
+        var sel = sels[sp].trim();
+        if (!sel) continue;
+        var m = new RegExp(src, 'i').exec(sel);
+        var emitted = transform(sel, m, nodes);
+        if (emitted) out += emitted + '{' + decls + '}\\n';
+      }
+      return out;
+    }
+
+    function walkList(list) {
+      var out = '';
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i];
+        // CSSKeyframesRule also has .cssRules (keyframe steps) but must NOT
+        // be recursed into — handled by extractKeyframesCSS.
+        if (typeof CSSKeyframesRule !== 'undefined' && r instanceof CSSKeyframesRule) continue;
+        if (r.cssRules) {
+          var mq = (r.media && r.media.mediaText) || '';
+          if (/prefers-color-scheme/i.test(mq)) continue;
+          var inner = walkList(r.cssRules);
+          // Strip @media wrappers that gate by device capability — the iframe's
+          // capabilities may not match the host page's, which would silently
+          // suppress hover rules (this is the bug where hover "doesn't fire").
+          // Examples: @media (hover: hover) { .btn:hover {...} } — we want the
+          // .btn:hover rule to ALWAYS be active in the preview.
+          var capabilityGated = /\\b(hover|any-hover|pointer|any-pointer)\\s*:/i.test(mq);
+          if (mq && inner && !capabilityGated) out += '@media ' + mq + '{' + inner + '}';
+          else out += inner;
+        } else {
+          out += processRule(r);
+        }
+      }
+      return out;
+    }
+
+    var css = '';
+    for (var si = 0; si < document.styleSheets.length; si++) {
+      try { css += walkList(document.styleSheets[si].cssRules); } catch(e) {}
+    }
+    var adopted = document.adoptedStyleSheets;
+    if (adopted && adopted.length) {
+      for (var ai = 0; ai < adopted.length; ai++) {
+        try { css += walkList(adopted[ai].cssRules); } catch(e) {}
+      }
+    }
+    return css;
+  }
+
+  // Map from CSS pseudo-class name to the data-attribute polyfill (set by the
+  // tiny <script> injected in the preview iframe).  Pseudos not listed here
+  // don't get an attribute variant (they're driven by real state — disabled,
+  // checked, visited — and already work without a polyfill).
+  var PSEUDO_ATTR_MAP = {
+    'hover':         'data-mc-hover',
+    'active':        'data-mc-active',
+    'focus':         'data-mc-focus',
+    'focus-visible': 'data-mc-focus',
+    'focus-within':  'data-mc-focus-within'
+  };
+
+  // ── Live pseudo-state CSS (triple-emission) ───────────────────────────────
+  // For each pseudo-state rule we emit THREE selector variants, comma-joined:
+  //   1. ORIGINAL selector verbatim (works when context survives in iframe).
+  //   2. [data-magic-id="N"]:hover rest   — browser-native :hover path.
+  //   3. [data-magic-id="N"][data-mc-hover] rest   — attribute polyfill path.
+  // The third variant is the belt-and-suspenders fix: a tiny script in the
+  // iframe toggles data-mc-hover/data-mc-active/data-mc-focus on real events,
+  // guaranteeing the state paints even if the browser's :hover pseudo is
+  // silently suppressed (e.g. by a @media (hover: hover) wrapper we missed,
+  // by a parent pointer-events issue, or by DevTools pane event quirks).
+  function buildLivePseudoCSS(root) {
+    return walkPseudoRules(root, function(sel, m, nodes) {
+      if (!m) return '';
+      var anchorSel = sel.slice(0, m.index).trim() || '*';
+      var pseudo    = m[0];        // ':hover'
+      var pseudoKey = m[1].toLowerCase(); // 'hover'
+      var rest      = sel.slice(m.index + m[0].length);
+      var attrSel   = PSEUDO_ATTR_MAP[pseudoKey] ? '[' + PSEUDO_ATTR_MAP[pseudoKey] + ']' : '';
+      var out = sel; // verbatim first
+      for (var ni = 0; ni < nodes.length; ni++) {
+        try {
+          if (anchorSel === '*' || nodes[ni].matches(anchorSel)) {
+            out += ',[data-magic-id="' + ni + '"]' + pseudo + rest;
+            if (attrSel) {
+              out += ',[data-magic-id="' + ni + '"]' + attrSel + rest;
+            }
+          }
+        } catch(e) {}
+      }
+      return out;
+    });
+  }
+
+  // ── Forced-state CSS (per pseudo) ─────────────────────────────────────────
+  // Strips the matched pseudo so the rule applies unconditionally — the
+  // equivalent of DevTools' "Force element state" but for every element in
+  // the copied subtree.  Dual-emitted for the same reason as the live CSS.
+  function buildForcedStateCSS(root, pseudoName) {
+    var oneSrc = '(?<![:\\\\\\\\]):(' + pseudoName + ')(?![\\\\w-])';
+    return walkPseudoRules(root, function(sel, m, nodes) {
+      if (!m) return '';
+      var anchorSel = sel.slice(0, m.index).trim() || '*';
+      var rest      = sel.slice(m.index + m[0].length);
+      var strippedOriginal = (anchorSel === '*' ? '' : anchorSel) + rest;
+      if (!strippedOriginal.trim()) strippedOriginal = '*';
+      var out = strippedOriginal;
+      for (var ni = 0; ni < nodes.length; ni++) {
+        try {
+          if (anchorSel === '*' || nodes[ni].matches(anchorSel)) {
+            var tail = rest.trim() ? rest : '';
+            out += ',[data-magic-id="' + ni + '"]' + tail;
+          }
+        } catch(e) {}
+      }
+      return out;
+    }, oneSrc);
+  }
+
+  function buildForcedStateMap(root) {
+    var STATES = ['hover','active','focus','focus-visible','focus-within','visited','checked','disabled'];
+    var out = Object.create(null);
+    for (var si = 0; si < STATES.length; si++) {
+      try { out[STATES[si]] = buildForcedStateCSS(root, STATES[si]); }
+      catch(e) { out[STATES[si]] = ''; }
+    }
+    return out;
+  }
+
+  // ── @keyframes extraction ─────────────────────────────────────────────────
+  // Hover rules often reference animations; without the @keyframes definitions
+  // the animation fails silently in the iframe.
+  function extractKeyframesCSS() {
+    var css = '';
+    function walk(list) {
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i];
+        if (typeof CSSKeyframesRule !== 'undefined' && r instanceof CSSKeyframesRule) {
+          try { css += r.cssText + '\\n'; } catch(e) {}
+        } else if (r.cssRules) {
+          walk(r.cssRules);
+        }
+      }
+    }
+    for (var si = 0; si < document.styleSheets.length; si++) {
+      try { walk(document.styleSheets[si].cssRules); } catch(e) {}
+    }
+    var adopted = document.adoptedStyleSheets;
+    if (adopted && adopted.length) {
+      for (var ai = 0; ai < adopted.length; ai++) {
+        try { walk(adopted[ai].cssRules); } catch(e) {}
+      }
+    }
+    return css;
+  }
+
+  // ── Frozen-copy helpers (chip-selected states only) ───────────────────────
   function buildOverrideMap(activeStates) {
     if (!activeStates || !activeStates.length) return [];
-    var sorted = activeStates.slice().sort(function(a, b) { return b.length - a.length; });
-    // No escaping needed — hyphens in group alternation are literal.
+    var sorted = activeStates.slice().sort(function(a,b){ return b.length - a.length; });
     var regex = new RegExp(':(' + sorted.join('|') + ')', 'gi');
     var rules = [];
-    allSheetRules(function(rule) {
-      if (!rule.selectorText || !rule.style) return;
+    allSheetRules(function(r) {
+      if (!r.selectorText || !r.style) return;
       regex.lastIndex = 0;
-      if (!regex.test(rule.selectorText)) { regex.lastIndex = 0; return; }
+      if (!regex.test(r.selectorText)) { regex.lastIndex = 0; return; }
       regex.lastIndex = 0;
-      rule.selectorText.split(',').forEach(function(part) {
-        var original = part.trim();
-        var found = [];
-        for (var ai = 0; ai < activeStates.length; ai++) {
-          if (original.indexOf(':' + activeStates[ai]) !== -1) found.push(activeStates[ai]);
-        }
-        if (!found.length) return;
+      var parts = r.selectorText.split(',');
+      for (var sp = 0; sp < parts.length; sp++) {
+        var original = parts[sp].trim();
         var base = original.replace(regex, '').trim() || '*';
         var props = Object.create(null);
-        for (var pi = 0; pi < rule.style.length; pi++) {
-          var p = rule.style[pi];
-          props[p] = rule.style.getPropertyValue(p);
+        for (var pi = 0; pi < r.style.length; pi++) {
+          var p = r.style[pi];
+          props[p] = r.style.getPropertyValue(p);
         }
-        rules.push({ original: original, base: base, states: found, props: props });
-      });
+        rules.push({ base: base, props: props });
+      }
       regex.lastIndex = 0;
     });
     return rules;
@@ -157,51 +389,13 @@ const serializerBody = `
     return extra;
   }
 
-  // ── 4. Anchor detection for ancestor-triggered states ─────────────────────
-  // Given ".nav:hover .link" (original), state="hover", and targetEl = .link,
-  // returns the index in originals of the element that carries :hover (.nav).
-  // Returns -1 if the anchor is outside the captured subtree.
-  function findAnchorIndex(targetEl, original, state, originals) {
-    var marker = ':' + state;
-    var idx = original.indexOf(marker);
-    if (idx === -1) return -1;
-    // Extract the compound selector that carries the pseudo-class
-    var before = original.substring(0, idx);
-    var segments = before.split(/[\\s>+~]+/);
-    var anchorSel = segments[segments.length - 1];
-    if (!anchorSel || anchorSel === '*') return -1;
-    for (var i = 0; i < originals.length; i++) {
-      if (originals[i] === targetEl) continue;
-      try {
-        if (originals[i].contains && originals[i].contains(targetEl) &&
-            originals[i].matches && originals[i].matches(anchorSel)) {
-          return i;
-        }
-      } catch(e) {}
-    }
-    return -1;
-  }
-
-  // ── 5. Tree helpers ───────────────────────────────────────────────────────
-  function gatherTree(root) {
-    var originals = [root];
-    var all = root.querySelectorAll('*');
-    for (var i = 0; i < all.length; i++) originals.push(all[i]);
-    return originals;
-  }
-
-  // Inline all computed standard properties + all known CSS custom properties.
-  // customPropNames must be pre-computed to avoid redundant stylesheet scans.
+  // ── Computed CSS builder ──────────────────────────────────────────────────
   function buildComputedCSS(el, customPropNames) {
-    var computed = getComputedStyle(el);
-    var css = '';
+    var computed = getComputedStyle(el), css = '';
     for (var j = 0; j < computed.length; j++) {
       var p = computed[j];
       css += p + ':' + computed.getPropertyValue(p) + ';';
     }
-    // Inline custom properties with their RESOLVED value for this element
-    // (getPropertyValue resolves inheritance, so .btn correctly gets --btn-bg
-    //  even if it was defined on a parent .card).
     for (var ci = 0; ci < customPropNames.length; ci++) {
       var cp = customPropNames[ci];
       var cv = computed.getPropertyValue(cp).trim();
@@ -210,22 +404,24 @@ const serializerBody = `
     return css;
   }
 
-  // ── 6. Serializers ────────────────────────────────────────────────────────
+  // ── Serializers ───────────────────────────────────────────────────────────
+  function gatherTree(root) {
+    var nodes = [root], all = root.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) nodes.push(all[i]);
+    return nodes;
+  }
 
-  // FROZEN: sent to clipboard. Base computed + pseudo overrides inlined.
-  // No data-magic-id. Fully self-contained, no external deps.
+  // FROZEN: base computed + chip-state overrides inlined.  Clipboard copy.
   function serializeFrozen(root, overrideRules) {
     var originals = gatherTree(root);
     var clone = root.cloneNode(true);
     var clones = [clone];
     var ca = clone.querySelectorAll('*');
     for (var i = 0; i < ca.length; i++) clones.push(ca[i]);
-
     for (var k = 0; k < originals.length; k++) {
       var orig = originals[k], target = clones[k];
       if (!(orig instanceof Element) || !target || !('style' in target)) continue;
-      var computed = getComputedStyle(orig);
-      var css = '';
+      var computed = getComputedStyle(orig), css = '';
       for (var j = 0; j < computed.length; j++) {
         var p = computed[j];
         css += p + ':' + computed.getPropertyValue(p) + ';';
@@ -237,57 +433,21 @@ const serializerBody = `
     return clone.outerHTML;
   }
 
-  // LIVE: sent to preview iframe alongside liveCSS.
-  // Has data-magic-id="N" + base computed + resolved custom props inlined.
+  // LIVE: base computed + custom props inlined + data-magic-id stamped.
+  // data-magic-id="N" must match the index used in buildLivePseudoCSS.
   function serializeLive(root, customPropNames) {
     var originals = gatherTree(root);
     var clone = root.cloneNode(true);
     var clones = [clone];
     var ca = clone.querySelectorAll('*');
     for (var i = 0; i < ca.length; i++) clones.push(ca[i]);
-
     for (var k = 0; k < originals.length; k++) {
       var orig = originals[k], target = clones[k];
       if (!(orig instanceof Element) || !target || !('style' in target)) continue;
       target.style.cssText = buildComputedCSS(orig, customPropNames);
       target.setAttribute('data-magic-id', String(k));
     }
-    return { html: clone.outerHTML, originals: originals };
-  }
-
-  // LIVE CSS: state-aware rules using data-magic-id selectors.
-  function buildLiveCSS(originals, overrideRules, preamble) {
-    var css = preamble || '';
-    var seen = Object.create(null);
-
-    for (var ri = 0; ri < overrideRules.length; ri++) {
-      var rule = overrideRules[ri];
-      var decls = '';
-      for (var dp in rule.props) decls += dp + ':' + rule.props[dp] + ' !important;';
-      if (!decls) continue;
-
-      for (var ni = 0; ni < originals.length; ni++) {
-        try { if (!originals[ni].matches || !originals[ni].matches(rule.base)) continue; }
-        catch(e) { continue; }
-
-        for (var si = 0; si < rule.states.length; si++) {
-          var state = rule.states[si];
-          var anchorIdx = findAnchorIndex(originals[ni], rule.original, state, originals);
-          var sel;
-          if (anchorIdx >= 0) {
-            // e.g. .card:hover .title → [data-magic-id="CARD"]:hover [data-magic-id="TITLE"]
-            sel = '[data-magic-id="' + anchorIdx + '"]:' + state +
-                  ' [data-magic-id="' + ni + '"]';
-          } else {
-            // Direct: .btn:hover → [data-magic-id="BTN"]:hover
-            sel = '[data-magic-id="' + ni + '"]:' + state;
-          }
-          var entry = sel + '{' + decls + '}';
-          if (!seen[entry]) { css += entry; seen[entry] = 1; }
-        }
-      }
-    }
-    return css;
+    return clone.outerHTML;
   }
 `
 
@@ -298,27 +458,24 @@ export function buildDevtoolsEvalSnippet(states: string[]): string {
     return { __magicCopyError: "No element selected in the Elements panel." };
   }
   try {
-    // Collect all known custom property names once (expensive, do it once)
-    var customPropNames = [];
-    (function() {
-      var names = Object.create(null);
-      allSheetRules(function(r) {
-        if (!r.style) return;
-        for (var pi = 0; pi < r.style.length; pi++) {
-          var p = r.style[pi].trim();
-          if (p.indexOf('--') === 0) names[p] = 1;
-        }
-      });
-      for (var n in names) customPropNames.push(n);
-    })();
-
-    var overrideRules = buildOverrideMap(${JSON.stringify(states)});
-    var preamble = buildRootVarsCSS() + extractFontFaceCSS();
-    var liveData = serializeLive($0, customPropNames);
-    var liveCSS = buildLiveCSS(liveData.originals, overrideRules, preamble);
-    var frozen = serializeFrozen($0, overrideRules);
-    return { frozen: frozen, liveHTML: liveData.html, liveCSS: liveCSS };
-  } catch (e) {
+    var customPropNames = collectCustomPropNames();
+    var overrideRules   = buildOverrideMap(${JSON.stringify(states)});
+    var pageBg          = getPageBackground();
+    var schemeCSS       = extractColorSchemeCSS();
+    var liveCSS         = buildRootVarsCSS(customPropNames)
+                        + extractFontFaceCSS()
+                        + extractKeyframesCSS()
+                        + buildLivePseudoCSS($0);
+    return {
+      frozen:         serializeFrozen($0, overrideRules),
+      liveHTML:       serializeLive($0, customPropNames),
+      liveCSS:        liveCSS,
+      forcedStateCSS: buildForcedStateMap($0),
+      pageBackground: pageBg.color,
+      isDark:         pageBg.isDark,
+      schemeCSS:      schemeCSS
+    };
+  } catch(e) {
     return { __magicCopyError: String((e && e.message) || e) };
   }
 })()`
