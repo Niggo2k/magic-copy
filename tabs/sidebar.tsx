@@ -1,6 +1,7 @@
-import { useCallback, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 
 import MonacoSource from "~components/MonacoSource"
+import { convertHtmlToTailwind } from "~lib/css-to-tailwind"
 import { buildDevtoolsEvalSnippet } from "~lib/inline-styles"
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -12,6 +13,8 @@ type Status =
   | { kind: "error"; message: string }
 
 type Tab = "preview" | "source"
+
+type OutputFormat = "css" | "tailwind"
 
 interface EvalResult {
   frozen: string         // base + pseudo overrides inlined → clipboard
@@ -131,6 +134,32 @@ function Sidebar() {
   const [activeTab, setActiveTab] = useState<Tab>("preview")
   const [activeStates, setActiveStates] = useState<Set<string>>(new Set())
   const [previewDark, setPreviewDark] = useState<boolean>(false)
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>("css")
+  const [tailwindFrozen, setTailwindFrozen] = useState<string | null>(null)
+  const [tailwindConverting, setTailwindConverting] = useState(false)
+
+  // Recompute Tailwind output whenever a new copy lands or the user switches
+  // to Tailwind mode. Cancelled via `cancelled` flag so a slow conversion
+  // can't overwrite a newer one.
+  useEffect(() => {
+    if (!result || outputFormat !== "tailwind") return
+    if (tailwindFrozen !== null) return
+    let cancelled = false
+    setTailwindConverting(true)
+    convertHtmlToTailwind(result.frozen)
+      .then((converted) => {
+        if (!cancelled) setTailwindFrozen(converted)
+      })
+      .catch(() => {
+        if (!cancelled) setTailwindFrozen(result.frozen)
+      })
+      .finally(() => {
+        if (!cancelled) setTailwindConverting(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [result, outputFormat, tailwindFrozen])
 
   const toggleState = useCallback((id: string) => {
     setActiveStates((prev) => {
@@ -160,18 +189,38 @@ function Sidebar() {
         return
       }
 
-      await navigator.clipboard.writeText(evalResult.frozen)
-      setStatus({ kind: "ok", bytes: evalResult.frozen.length })
       setResult(evalResult)
+      setTailwindFrozen(null) // invalidate the previous Tailwind conversion
       setPreviewDark(evalResult.isDark)
       setActiveTab("preview")
+
+      if (outputFormat === "tailwind") {
+        try {
+          const converted = await convertHtmlToTailwind(evalResult.frozen)
+          setTailwindFrozen(converted)
+          await navigator.clipboard.writeText(converted)
+          setStatus({ kind: "ok", bytes: converted.length })
+        } catch (err) {
+          await navigator.clipboard.writeText(evalResult.frozen)
+          setStatus({
+            kind: "error",
+            message:
+              "Tailwind conversion failed, copied raw CSS instead: " +
+              (err instanceof Error ? err.message : String(err))
+          })
+        }
+        return
+      }
+
+      await navigator.clipboard.writeText(evalResult.frozen)
+      setStatus({ kind: "ok", bytes: evalResult.frozen.length })
     } catch (err) {
       setStatus({
         kind: "error",
         message: err instanceof Error ? err.message : String(err)
       })
     }
-  }, [activeStates])
+  }, [activeStates, outputFormat])
 
   return (
     <div style={wrapperStyle}>
@@ -191,9 +240,44 @@ function Sidebar() {
           onClick={handleCopy}
           disabled={status.kind === "working"}
           style={copyBtnStyle}>
-          {status.kind === "working" ? "Copying…" : "Copy $0 with inline CSS"}
+          {status.kind === "working"
+            ? "Copying…"
+            : outputFormat === "tailwind"
+              ? "Copy $0 as Tailwind"
+              : "Copy $0 with inline CSS"}
         </button>
-        <StatusBadge status={status} />
+        <div style={formatGroupStyle} role="group" aria-label="Output format">
+          {(["css", "tailwind"] as OutputFormat[]).map((fmt) => {
+            const on = outputFormat === fmt
+            return (
+              <button
+                key={fmt}
+                type="button"
+                className="mc-btn"
+                onClick={() => setOutputFormat(fmt)}
+                title={
+                  fmt === "css"
+                    ? "Inline computed CSS on every element"
+                    : "Convert styles to Tailwind utility classes"
+                }
+                style={{
+                  ...formatBtnBase,
+                  background: on ? "#3b82f6" : "#2a2d31",
+                  color: on ? "#fff" : "#c8ccd1",
+                  borderColor: on ? "#3b82f6" : "#3a3e44"
+                }}>
+                {fmt === "css" ? "CSS" : "Tailwind"}
+              </button>
+            )
+          })}
+        </div>
+        <StatusBadge
+          status={
+            tailwindConverting && status.kind !== "working"
+              ? { kind: "working" }
+              : status
+          }
+        />
       </div>
 
       {/* ── Pseudo-state toggles ── */}
@@ -289,9 +373,14 @@ function Sidebar() {
             // rendered with Monaco + Shiki for proper HTML/CSS syntax highlighting.
             <div style={sourceWrapperStyle}>
               <MonacoSource
-                value={result.frozen}
+                value={
+                  outputFormat === "tailwind"
+                    ? tailwindFrozen ?? result.frozen
+                    : result.frozen
+                }
                 language="html"
                 dark={previewDark}
+                preserveClasses={outputFormat === "tailwind"}
               />
             </div>
           )}
@@ -382,6 +471,25 @@ const copyBtnStyle: React.CSSProperties = {
   color: "#ffffff",
   whiteSpace: "nowrap",
   boxShadow: "0 1px 0 rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.15)"
+}
+
+const formatGroupStyle: React.CSSProperties = {
+  display: "inline-flex",
+  gap: "2px",
+  padding: "2px",
+  background: "#16181b",
+  border: "1px solid #2b2e33",
+  borderRadius: "999px"
+}
+
+const formatBtnBase: React.CSSProperties = {
+  padding: "3px 10px",
+  fontSize: "11px",
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+  border: "1px solid",
+  borderRadius: "999px",
+  cursor: "pointer",
+  lineHeight: "1.6"
 }
 
 const statesRowStyle: React.CSSProperties = {

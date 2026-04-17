@@ -93,12 +93,14 @@ interface MonacoSourceProps {
   value: string
   language?: Language
   dark?: boolean
+  preserveClasses?: boolean
 }
 
 function MonacoSource({
   value,
   language = "html",
-  dark = false
+  dark = false,
+  preserveClasses = false
 }: MonacoSourceProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null)
@@ -110,7 +112,8 @@ function MonacoSource({
   const formatted = useMemo(() => {
     if (language === "html") {
       try {
-        return htmlBeautify(stripDeadAttrs(value), {
+        const cleaned = preserveClasses ? value : stripDeadAttrs(value)
+        return htmlBeautify(cleaned, {
           indent_size: 2,
           wrap_line_length: 0,
           preserve_newlines: false,
@@ -131,7 +134,7 @@ function MonacoSource({
       }
     }
     return value
-  }, [value, language])
+  }, [value, language, preserveClasses])
 
   useEffect(() => {
     if (!containerRef.current) return
