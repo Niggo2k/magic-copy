@@ -30,7 +30,8 @@
       "contextMenus",
       "activeTab",
       "scripting",
-      "clipboardWrite"
+      "clipboardWrite",
+      "debugger"
     ],
     "host_permissions": [
       "<all_urls>"

@@ -172,6 +172,22 @@ const serializerBody = `
   // class name '.hover\\:bg-red-500:hover' is not split at the first ':hover'.
   var MAGIC_PSEUDO_SRC = '(?<![:\\\\\\\\]):(' + MAGIC_PSEUDO.join('|') + ')(?![\\\\w-])';
 
+  // Strip every MAGIC_PSEUDO token from a selector, returning the stripped
+  // anchor plus the deduped list of pseudo names found.  Functional pseudos
+  // (:not(...), :is(...), :has(...)) are preserved verbatim so that anchor
+  // matching still honours :not() exclusions.
+  function extractPseudos(sel) {
+    var re = new RegExp(MAGIC_PSEUDO_SRC, 'gi');
+    var pseudos = [];
+    var anchor = sel.replace(re, function(_, name) {
+      var key = name.toLowerCase();
+      if (pseudos.indexOf(key) === -1) pseudos.push(key);
+      return '';
+    });
+    anchor = anchor.trim() || '*';
+    return { anchor: anchor, pseudos: pseudos };
+  }
+
   function buildDecls(style) {
     var decls = '';
     for (var pi = 0; pi < style.length; pi++) {
@@ -251,7 +267,10 @@ const serializerBody = `
     'active':        'data-mc-active',
     'focus':         'data-mc-focus',
     'focus-visible': 'data-mc-focus',
-    'focus-within':  'data-mc-focus-within'
+    'focus-within':  'data-mc-focus-within',
+    'visited':       'data-mc-visited',
+    'checked':       'data-mc-checked',
+    'disabled':      'data-mc-disabled'
   };
 
   // ── Live pseudo-state CSS (triple-emission) ───────────────────────────────
@@ -272,10 +291,14 @@ const serializerBody = `
       var pseudoKey = m[1].toLowerCase(); // 'hover'
       var rest      = sel.slice(m.index + m[0].length);
       var attrSel   = PSEUDO_ATTR_MAP[pseudoKey] ? '[' + PSEUDO_ATTR_MAP[pseudoKey] + ']' : '';
+      // Use the fully-stripped anchor for node matching so compound pseudos
+      // like ".btn:disabled:hover" still resolve to ".btn" rather than a
+      // mid-selector prefix that might include another pseudo.
+      var matchAnchor = extractPseudos(sel).anchor;
       var out = sel; // verbatim first
       for (var ni = 0; ni < nodes.length; ni++) {
         try {
-          if (anchorSel === '*' || nodes[ni].matches(anchorSel)) {
+          if (matchAnchor === '*' || nodes[ni].matches(matchAnchor)) {
             out += ',[data-magic-id="' + ni + '"]' + pseudo + rest;
             if (attrSel) {
               out += ',[data-magic-id="' + ni + '"]' + attrSel + rest;
@@ -295,16 +318,16 @@ const serializerBody = `
     var oneSrc = '(?<![:\\\\\\\\]):(' + pseudoName + ')(?![\\\\w-])';
     return walkPseudoRules(root, function(sel, m, nodes) {
       if (!m) return '';
-      var anchorSel = sel.slice(0, m.index).trim() || '*';
-      var rest      = sel.slice(m.index + m[0].length);
-      var strippedOriginal = (anchorSel === '*' ? '' : anchorSel) + rest;
+      // Strip ALL MAGIC_PSEUDO tokens so compound selectors like
+      // ".btn:disabled:hover" collapse to ".btn" (keeping :not()/etc intact).
+      var extracted = extractPseudos(sel);
+      var strippedOriginal = extracted.anchor;
       if (!strippedOriginal.trim()) strippedOriginal = '*';
       var out = strippedOriginal;
       for (var ni = 0; ni < nodes.length; ni++) {
         try {
-          if (anchorSel === '*' || nodes[ni].matches(anchorSel)) {
-            var tail = rest.trim() ? rest : '';
-            out += ',[data-magic-id="' + ni + '"]' + tail;
+          if (extracted.anchor === '*' || nodes[ni].matches(extracted.anchor)) {
+            out += ',[data-magic-id="' + ni + '"]';
           }
         } catch(e) {}
       }
@@ -320,6 +343,135 @@ const serializerBody = `
       catch(e) { out[STATES[si]] = ''; }
     }
     return out;
+  }
+
+  // ── State inspector map ───────────────────────────────────────────────────
+  // For every element in the subtree, list the pseudo-classes that have at
+  // least one rule matching that element. Powers the "States" panel in the
+  // sidebar so the user can force a state on a single element.
+  function buildStateMap(root) {
+    var nodes = gatherTree(root);
+    var perNode = [];
+    for (var i = 0; i < nodes.length; i++) perNode.push(Object.create(null));
+
+    function processRule(r) {
+      if (!r.selectorText || !r.style) return;
+      var sels = r.selectorText.split(',');
+      for (var sp = 0; sp < sels.length; sp++) {
+        var sel = sels[sp].trim();
+        if (!sel) continue;
+        var extracted = extractPseudos(sel);
+        if (!extracted.pseudos.length) continue;
+        for (var ni = 0; ni < nodes.length; ni++) {
+          try {
+            if (extracted.anchor === '*' || nodes[ni].matches(extracted.anchor)) {
+              for (var pk = 0; pk < extracted.pseudos.length; pk++) {
+                perNode[ni][extracted.pseudos[pk]] = 1;
+              }
+            }
+          } catch(e) {}
+        }
+      }
+    }
+
+    function walkList(list) {
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i];
+        if (typeof CSSKeyframesRule !== 'undefined' && r instanceof CSSKeyframesRule) continue;
+        if (r.cssRules) walkList(r.cssRules);
+        else processRule(r);
+      }
+    }
+
+    for (var si = 0; si < document.styleSheets.length; si++) {
+      try { walkList(document.styleSheets[si].cssRules); } catch(e) {}
+    }
+    var adopted = document.adoptedStyleSheets;
+    if (adopted && adopted.length) {
+      for (var ai = 0; ai < adopted.length; ai++) {
+        try { walkList(adopted[ai].cssRules); } catch(e) {}
+      }
+    }
+
+    var out = [];
+    for (var k = 0; k < nodes.length; k++) {
+      var statesMap = perNode[k];
+      var states = Object.keys(statesMap);
+      if (!states.length) continue;
+      var el = nodes[k];
+      var label = (el.tagName || 'node').toLowerCase();
+      if (el.id) label += '#' + el.id;
+      if (el.classList && el.classList.length) {
+        var max = el.classList.length < 3 ? el.classList.length : 3;
+        for (var ci = 0; ci < max; ci++) label += '.' + el.classList[ci];
+      }
+      out.push({ id: k, label: label, states: states });
+    }
+    return out;
+  }
+
+  // ── Per-element frozen overrides ──────────────────────────────────────────
+  // Resolve pseudo-state CSS rules that should be inlined on specific elements
+  // (chosen via the per-element States panel). Returns a map magicId -> props.
+  function buildPerElementOverrides(root, perElementStates) {
+    var result = Object.create(null);
+    if (!perElementStates) return result;
+    var ids = Object.keys(perElementStates);
+    if (!ids.length) return result;
+    var nodes = gatherTree(root);
+
+    function processRule(r) {
+      if (!r.selectorText || !r.style) return;
+      var sels = r.selectorText.split(',');
+      for (var sp = 0; sp < sels.length; sp++) {
+        var sel = sels[sp].trim();
+        if (!sel) continue;
+        var extracted = extractPseudos(sel);
+        if (!extracted.pseudos.length) continue;
+        for (var k = 0; k < ids.length; k++) {
+          var id = ids[k];
+          var requested = perElementStates[id];
+          if (!requested) continue;
+          // Rule applies if ANY of the selector's pseudos is requested.
+          var match = false;
+          for (var pk = 0; pk < extracted.pseudos.length; pk++) {
+            if (requested.indexOf(extracted.pseudos[pk]) !== -1) { match = true; break; }
+          }
+          if (!match) continue;
+          var node = nodes[Number(id)];
+          if (!node) continue;
+          try {
+            if (extracted.anchor === '*' || node.matches(extracted.anchor)) {
+              if (!result[id]) result[id] = Object.create(null);
+              for (var pi = 0; pi < r.style.length; pi++) {
+                var p = r.style[pi];
+                result[id][p] = r.style.getPropertyValue(p);
+              }
+            }
+          } catch(e) {}
+        }
+      }
+    }
+
+    function walkList(list) {
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i];
+        if (typeof CSSKeyframesRule !== 'undefined' && r instanceof CSSKeyframesRule) continue;
+        if (r.cssRules) walkList(r.cssRules);
+        else processRule(r);
+      }
+    }
+
+    for (var si = 0; si < document.styleSheets.length; si++) {
+      try { walkList(document.styleSheets[si].cssRules); } catch(e) {}
+    }
+    var adopted = document.adoptedStyleSheets;
+    if (adopted && adopted.length) {
+      for (var ai = 0; ai < adopted.length; ai++) {
+        try { walkList(adopted[ai].cssRules); } catch(e) {}
+      }
+    }
+    return result;
   }
 
   // ── @keyframes extraction ─────────────────────────────────────────────────
@@ -411,8 +563,9 @@ const serializerBody = `
     return nodes;
   }
 
-  // FROZEN: base computed + chip-state overrides inlined.  Clipboard copy.
-  function serializeFrozen(root, overrideRules) {
+  // FROZEN: base computed + chip-state overrides + per-element overrides
+  // inlined. Clipboard copy.
+  function serializeFrozen(root, overrideRules, perElementOverrides) {
     var originals = gatherTree(root);
     var clone = root.cloneNode(true);
     var clones = [clone];
@@ -428,6 +581,10 @@ const serializerBody = `
       }
       var ov = getOverrides(orig, overrideRules);
       for (var ep in ov) css += ep + ':' + ov[ep] + ';';
+      if (perElementOverrides && perElementOverrides[k]) {
+        var pe = perElementOverrides[k];
+        for (var pep in pe) css += pep + ':' + pe[pep] + ';';
+      }
       target.style.cssText = css;
     }
     return clone.outerHTML;
@@ -451,26 +608,31 @@ const serializerBody = `
   }
 `
 
-export function buildDevtoolsEvalSnippet(states: string[]): string {
+export function buildDevtoolsEvalSnippet(
+  states: string[],
+  perElementStates: Record<number, string[]> = {}
+): string {
   return `(() => {
   ${serializerBody}
   if (typeof $0 === "undefined" || $0 === null) {
     return { __magicCopyError: "No element selected in the Elements panel." };
   }
   try {
-    var customPropNames = collectCustomPropNames();
-    var overrideRules   = buildOverrideMap(${JSON.stringify(states)});
-    var pageBg          = getPageBackground();
-    var schemeCSS       = extractColorSchemeCSS();
-    var liveCSS         = buildRootVarsCSS(customPropNames)
-                        + extractFontFaceCSS()
-                        + extractKeyframesCSS()
-                        + buildLivePseudoCSS($0);
+    var customPropNames     = collectCustomPropNames();
+    var overrideRules       = buildOverrideMap(${JSON.stringify(states)});
+    var perElementOverrides = buildPerElementOverrides($0, ${JSON.stringify(perElementStates)});
+    var pageBg              = getPageBackground();
+    var schemeCSS           = extractColorSchemeCSS();
+    var liveCSS             = buildRootVarsCSS(customPropNames)
+                            + extractFontFaceCSS()
+                            + extractKeyframesCSS()
+                            + buildLivePseudoCSS($0);
     return {
-      frozen:         serializeFrozen($0, overrideRules),
+      frozen:         serializeFrozen($0, overrideRules, perElementOverrides),
       liveHTML:       serializeLive($0, customPropNames),
       liveCSS:        liveCSS,
       forcedStateCSS: buildForcedStateMap($0),
+      stateMap:       buildStateMap($0),
       pageBackground: pageBg.color,
       isDark:         pageBg.isDark,
       schemeCSS:      schemeCSS
