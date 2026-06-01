@@ -32,6 +32,7 @@
 - [Loading the Extension in Chrome](#loading-the-extension-in-chrome)
 - [Using Magic Copy](#using-magic-copy)
 - [Project Structure](#project-structure)
+- [Contributing](#contributing)
 
 ---
 
@@ -149,6 +150,14 @@ While running `npm run dev`, Plasmo rebuilds on save — reload the extension fr
 | `lib/cdp.ts` | Chrome DevTools Protocol integration for pseudo-state capture |
 | `lib/css-to-tailwind.ts` | CSS → Tailwind conversion wrapper |
 | `lib/state-snapshot.ts` | State management for preview data |
+
+---
+
+## Contributing
+
+Contributions are welcome! Please read **[CONTRIBUTING.md](./CONTRIBUTING.md)** for
+branch naming, commit conventions, and the pull request and merge rules before
+opening a PR.
 
 ---
 
