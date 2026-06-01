@@ -12,6 +12,8 @@ jobs:
   release:
     name: Build, release & submit
     runs-on: ubuntu-latest
+    env:
+      SUBMIT_KEYS: ${{ secrets.SUBMIT_KEYS }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,7 +47,7 @@ jobs:
           generate_release_notes: true
 
       - name: Submit to Chrome Web Store (BPP)
-        if: ${{ secrets.SUBMIT_KEYS != '' }}
+        if: ${{ env.SUBMIT_KEYS != '' }}
         uses: PlasmoHQ/bpp@v3.8.0
         with:
           keys: ${{ secrets.SUBMIT_KEYS }}
