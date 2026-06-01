@@ -1,7 +1,7 @@
 {
   "name": "magic-copy",
   "displayName": "Magic Copy — Inline CSS",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Copy any HTML element with all computed CSS styles inlined. Works from the page right-click menu and from a DevTools Elements sidebar.",
   "author": "Nico Epp",
   "scripts": {
