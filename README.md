@@ -19,12 +19,6 @@
   <em>DevTools sidebar — live preview, Monaco source view, and CSS→Tailwind conversion</em>
 </p>
 
-<p align="center">
-  <img width="892" height="967" alt="Magic Copy inlined element output" src="https://github.com/user-attachments/assets/7d59979c-0048-4f56-a1eb-6e7a6ef95cd1" />
-  <br/>
-  <em>Captured element with computed styles inlined</em>
-</p>
-
 ---
 
 ## Table of Contents
